@@ -48,7 +48,6 @@ The response must match this schema exactly:
   "tags": ["tag1","tag2","tag3","tag4","tag5","tag6"]
 }`;
 
-  // Call the free Google Gemini 2.5 Flash model
   const apiKey = process.env.GEMINI_API_KEY;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
@@ -66,11 +65,7 @@ The response must match this schema exactly:
 /* ───────────────────── 2. VOICEOVER (Free Google Translation TTS Engine) ───────────────────── */
 async function generateVoiceover(text, outPath) {
   pushLog("Generating voiceover using free TTS backend...");
-  
-  // Clean text from symbols
   const cleanText = text.replace(/[*#()\[\]]/g, "").trim();
-  
-  // Google Translate speech endpoint allows 200 char chunks max. We chunk it seamlessly:
   const chunks = cleanText.match(/[^.!?]+[.!?]*|.{1,200}/g) || [cleanText];
   const audioBuffers = [];
 
@@ -89,8 +84,6 @@ async function generateVoiceover(text, outPath) {
 /* ───────────────────── 3. VISUALS (Pollinations AI - 100% Free Images) ───────────────────── */
 async function generateImage(prompt, outPath) {
   pushLog(`Generating free image for prompt: "${prompt.substring(0, 40)}..."`);
-  
-  // Clean up special characters from the prompt string for safe URI conversion
   const formattedPrompt = encodeURIComponent(`${prompt}, Cinematic, high detail, 8k, no text, no watermark, 16:9 aspect ratio`);
   const pollinationsUrl = `https://image.pollinations.ai/p/${formattedPrompt}?width=1280&height=720&seed=${Math.floor(Math.random() * 100000)}&nologo=true`;
 
@@ -114,4 +107,103 @@ async function assembleVideo({ imagePaths, audioPath, outPath }) {
     const cmd = ffmpeg();
     imagePaths.forEach((img) => cmd.input(img).loop(perImage));
     cmd.input(audioPath);
-    // Note: If you have your remaining trailing code logic below this block, paste it here.
+    cmd.outputOptions(["-c:v libx264", "-pix_fmt yuv420p", "-c:a aac", "-shortest"]);
+    cmd.output(outPath)
+       .on("end", () => resolve(outPath))
+       .on("error", (err) => reject(err))
+       .run();
+  });
+}
+
+/* ───────────────────── 5. OAUTH & BOT RUNNERS ───────────────────── */
+const oauth2Client = new google.auth.OAuth2(
+  process.env.YOUTUBE_CLIENT_ID,
+  process.env.YOUTUBE_CLIENT_SECRET,
+  process.env.YOUTUBE_REDIRECT_URI || "https://autotube-bot-production.up.railway.app/oauth2callback"
+);
+
+if (fs.existsSync(TOKEN_PATH)) {
+  oauth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8")));
+}
+
+async function uploadToYouTube({ videoPath, title, description, tags }) {
+  const youtube = google.youtube({ version: "v3", auth: oauth2Client });
+  await youtube.videos.insert({
+    part: "snippet,status",
+    requestBody: {
+      snippet: { title, description, tags, categoryId: "22" },
+      status: { privacyStatus: process.env.VIDEO_PRIVACY || "public" }
+    },
+    media: { body: fs.createReadStream(videoPath) }
+  });
+}
+
+async function runPipeline() {
+  if (isRunning) return pushLog("Pipeline is already running.");
+  isRunning = true;
+  lastRun = new Date().toISOString();
+  pushLog("Starting automated content pipeline...");
+
+  try {
+    const data = await researchAndWrite({ niche: process.env.CHANNEL_NICHE || "auto" });
+    pushLog(`Script ready. Title: ${data.title}`);
+
+    const audioPath = path.join(DATA_DIR, "voiceover.mp3");
+    await generateVoiceover(data.script, audioPath);
+
+    const imagePaths = [];
+    for (let i = 0; i < data.scenes.length; i++) {
+      const imgPath = path.join(DATA_DIR, `scene_${i}.jpg`);
+      await generateImage(data.scenes[i], imgPath);
+      imagePaths.push(imgPath);
+    }
+
+    const videoPath = path.join(DATA_DIR, "output.mp4");
+    pushLog("Assembling final video file...");
+    await assembleVideo({ imagePaths, audioPath, outPath: videoPath });
+
+    pushLog("Uploading finished video to YouTube...");
+    await uploadToYouTube({ videoPath, title: data.title, description: data.description, tags: data.tags });
+
+    pushLog("✅ Pipeline completed successfully! Video published.");
+  } catch (err) {
+    pushLog(`❌ Pipeline failed: ${err.message}`);
+  } finally {
+    isRunning = false;
+  }
+}
+
+/* ───────────────────── 6. SERVER & ROUTES ───────────────────── */
+cron.schedule(process.env.CRON_SCHEDULE || "0 14 * * *", () => {
+  pushLog("Cron triggered schedule run...");
+  runPipeline();
+});
+
+app.get("/", (req, res) => {
+  const connected = oauth2Client.credentials && oauth2Client.credentials.refresh_token ? "YES ✓" : "NO";
+  res.send(`<pre>AutoTube Bot Status\n\nYouTube connected: ${connected}\nSchedule: ${process.env.CRON_SCHEDULE || "0 14 * * *"}\nLast run starting: ${lastRun || "none yet"}\n\nRoutes:\n  GET /auth     - Link account\n  GET /run-now  - Trigger pipeline\n  GET /logs     - View activity</pre>`);
+});
+
+app.get("/auth", (req, res) => {
+  const url = oauth2Client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"] });
+  res.redirect(url);
+});
+
+app.get("/oauth2callback", async (req, res) => {
+  const { tokens } = await oauth2Client.getToken(req.query.code);
+  oauth2Client.setCredentials(tokens);
+  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+  res.send("✅ YouTube connected! You can close this tab.");
+});
+
+app.get("/run-now", (req, res) => {
+  runPipeline();
+  res.send("Pipeline started. Check /logs for progress.");
+});
+
+app.get("/logs", (req, res) => {
+  res.send(`<pre>${log.join("\n") || "No logs available yet."}</pre>`);
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
