@@ -25,7 +25,7 @@ function pushLog(msg) {
   if (log.length > 200) log.shift();
 }
 
-/* ───────────────────── 1. RESEARCH + SCRIPT (Claude) ───────────────────── */
+/* ───────────────────── 1. RESEARCH + SCRIPT (OpenAI) ───────────────────── */
 async function researchAndWrite({ niche }) {
   const nicheInstruction =
     niche && niche !== "auto"
@@ -48,13 +48,17 @@ Write ONE complete, ready-to-produce video. Return ONLY valid JSON, no markdown 
 }`;
 
   const res = await axios.post(
-    "https://api.anthropic.com/v1/messages",
-    { model: "claude-sonnet-4-6", max_tokens: 1800, messages: [{ role: "user", content: prompt }] },
-    { headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" } }
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: prompt }]
+    },
+    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "content-type": "application/json" } }
   );
 
-  const text = res.data.content.map((b) => b.text || "").join("");
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
+  const text = res.data.choices[0].message.content;
+  return JSON.parse(text.trim());
 }
 
 /* ───────────────────── 2. VOICEOVER (OpenAI or ElevenLabs) ───────────────────── */
@@ -74,7 +78,7 @@ async function generateVoiceover(text, outPath) {
 
   const res = await axios.post(
     "https://api.openai.com/v1/audio/speech",
-    { model: "gpt-4o-mini-tts", voice: process.env.OPENAI_VOICE || "onyx", input: text },
+    { model: "tts-1", voice: process.env.OPENAI_VOICE || "onyx", input: text },
     { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "content-type": "application/json" }, responseType: "arraybuffer" }
   );
   fs.writeFileSync(outPath, res.data);
@@ -85,7 +89,7 @@ async function generateVoiceover(text, outPath) {
 async function generateImage(prompt, outPath) {
   const res = await axios.post(
     "https://api.openai.com/v1/images/generations",
-    { model: "gpt-image-1", prompt: `${prompt}. Cinematic, high detail, no text, no watermark, 16:9.`, size: "1792x1024" },
+    { model: "dall-e-3", prompt: `${prompt}. Cinematic, high detail, no text, no watermark, 16:9.`, size: "1024x1024", response_format: "b64_json" },
     { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "content-type": "application/json" } }
   );
   fs.writeFileSync(outPath, Buffer.from(res.data.data[0].b64_json, "base64"));
