@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
-  "dependencies": {
+  "dependencies": { "ffprobe-static": "^3.1.0",
     "axios": "^1.7.7",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
