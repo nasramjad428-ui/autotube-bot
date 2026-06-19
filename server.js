@@ -7,8 +7,10 @@ const path = require("path");
 const { google } = require("googleapis");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
+const ffprobePath = require("ffprobe-static").path;
 
 ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -25,7 +27,7 @@ function pushLog(msg) {
   if (log.length > 200) log.shift();
 }
 
-/* ───────────────────── 1. RESEARCH + SCRIPT (Google Gemini - Free Tier) ───────────────────── */
+/* ───────────────────── 1. RESEARCH + SCRIPT (Gemini - Free Tier) ───────────────────── */
 async function researchAndWrite({ niche }) {
   const nicheInstruction =
     niche && niche !== "auto"
@@ -53,16 +55,14 @@ The response must match this schema exactly:
 
   const res = await axios.post(url, {
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json"
-    }
+    generationConfig: { responseMimeType: "application/json" },
   });
 
   const text = res.data.candidates[0].content.parts[0].text;
   return JSON.parse(text.trim());
 }
 
-/* ───────────────────── 2. VOICEOVER (Free Google Translation TTS Engine) ───────────────────── */
+/* ───────────────────── 2. VOICEOVER (Free Google Translate TTS) ───────────────────── */
 async function generateVoiceover(text, outPath) {
   pushLog("Generating voiceover using free TTS backend...");
   const cleanText = text.replace(/[*#()\[\]]/g, "").trim();
@@ -72,16 +72,18 @@ async function generateVoiceover(text, outPath) {
   for (const chunk of chunks) {
     if (!chunk.trim()) continue;
     const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encodeURIComponent(chunk.trim())}`;
-    const response = await axios.get(ttsUrl, { responseType: "arraybuffer" });
+    const response = await axios.get(ttsUrl, {
+      responseType: "arraybuffer",
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
     audioBuffers.push(Buffer.from(response.data));
   }
 
-  const finalBuffer = Buffer.concat(audioBuffers);
-  fs.writeFileSync(outPath, finalBuffer);
+  fs.writeFileSync(outPath, Buffer.concat(audioBuffers));
   return outPath;
 }
 
-/* ───────────────────── 3. VISUALS (Pollinations AI - 100% Free Images) ───────────────────── */
+/* ───────────────────── 3. VISUALS (Pollinations AI - free) ───────────────────── */
 async function generateImage(prompt, outPath) {
   pushLog(`Generating free image for prompt: "${prompt.substring(0, 40)}..."`);
   const formattedPrompt = encodeURIComponent(`${prompt}, Cinematic, high detail, 8k, no text, no watermark, 16:9 aspect ratio`);
@@ -92,7 +94,7 @@ async function generateImage(prompt, outPath) {
   return outPath;
 }
 
-/* ───────────────────── 4. VIDEO ASSEMBLY (ffmpeg) ───────────────────── */
+/* ───────────────────── 4. VIDEO ASSEMBLY (ffmpeg) — FIXED ───────────────────── */
 function getAudioDuration(audioPath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(audioPath, (err, data) => (err ? reject(err) : resolve(data.format.duration)));
@@ -105,13 +107,33 @@ async function assembleVideo({ imagePaths, audioPath, outPath }) {
 
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg();
-    imagePaths.forEach((img) => cmd.input(img).loop(perImage));
+    imagePaths.forEach((img) => cmd.input(img).inputOptions(["-loop", "1"]));
     cmd.input(audioPath);
-    cmd.outputOptions(["-c:v libx264", "-pix_fmt yuv420p", "-c:a aac", "-shortest"]);
-    cmd.output(outPath)
-       .on("end", () => resolve(outPath))
-       .on("error", (err) => reject(err))
-       .run();
+
+    // Scale + trim each image to its slot, then concat them into one continuous video stream.
+    const filters = [];
+    imagePaths.forEach((_, i) => {
+      filters.push(
+        `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${perImage}[v${i}]`
+      );
+    });
+    const joins = imagePaths.map((_, i) => `[v${i}]`).join("");
+    filters.push(`${joins}concat=n=${imagePaths.length}:v=1:a=0[outv]`);
+
+    cmd
+      .complexFilter(filters, "outv")
+      .outputOptions([
+        "-map", "[outv]",
+        "-map", `${imagePaths.length}:a`,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-shortest",
+      ])
+      .output(outPath)
+      .on("end", () => resolve(outPath))
+      .on("error", (err) => reject(err))
+      .run();
   });
 }
 
@@ -132,9 +154,9 @@ async function uploadToYouTube({ videoPath, title, description, tags }) {
     part: "snippet,status",
     requestBody: {
       snippet: { title, description, tags, categoryId: "22" },
-      status: { privacyStatus: process.env.VIDEO_PRIVACY || "public" }
+      status: { privacyStatus: process.env.VIDEO_PRIVACY || "public" },
     },
-    media: { body: fs.createReadStream(videoPath) }
+    media: { body: fs.createReadStream(videoPath) },
   });
 }
 
@@ -185,15 +207,23 @@ app.get("/", (req, res) => {
 });
 
 app.get("/auth", (req, res) => {
-  const url = oauth2Client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"] });
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"],
+  });
   res.redirect(url);
 });
 
 app.get("/oauth2callback", async (req, res) => {
-  const { tokens } = await oauth2Client.getToken(req.query.code);
-  oauth2Client.setCredentials(tokens);
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
-  res.send("✅ YouTube connected! You can close this tab.");
+  try {
+    const { tokens } = await oauth2Client.getToken(req.query.code);
+    oauth2Client.setCredentials(tokens);
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+    res.send("✅ YouTube connected! You can close this tab.");
+  } catch (err) {
+    res.status(500).send("Auth failed: " + err.message);
+  }
 });
 
 app.get("/run-now", (req, res) => {
